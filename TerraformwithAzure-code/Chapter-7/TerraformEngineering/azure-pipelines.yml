@@ -1,0 +1,228 @@
+
+
+pr:
+  branches:
+    include: ["master", "develop"]
+
+trigger: 
+- master
+- develop
+
+pool:
+  vmImage: ubuntu-18.04
+
+variables:
+  folder_context: $(System.DefaultWorkingDirectory)/Terraform/environments
+
+
+stages:
+- stage: terraform_build
+  jobs:
+  - job: terraform_plan
+    steps:
+    - task: AzureKeyVault@1
+      inputs:
+        azureSubscription: 'book-azure-access'
+        KeyVaultName: 'book-keyvault'
+        SecretsFilter: 'state-resource-group, state-storage-container, state-storage-account, state-file-name, state-sas-token, client-id, client-secret, subscription-id, tenant-id'
+      displayName: 'Get key vault secrets as pipeline variables'
+
+    - bash: |
+        curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo apt-key add -
+        sudo apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main"
+        sudo apt-get update && sudo apt-get install terraform=0.14.10
+        terraform -help
+      displayName: 'Install Terraform'
+
+    - task: GoTool@0
+      inputs:
+        version: '1.15'
+      displayName: 'Installing golang needed for TerraTest '
+
+    - bash: |
+        curl -sL https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+        mkdir -p ~/azurerm_linter/
+        curl -Ls https://github.com/terraform-linters/tflint-ruleset-azurerm/releases/download/v0.12.0/tflint-ruleset-azurerm_linux_amd64.zip -o tflint-ruleset-azurerm_linux_amd64.zip && unzip tflint-ruleset-azurerm_linux_amd64.zip -d ~/azurerm_linter/ && rm tflint-ruleset-azurerm_linux_amd64.zip
+        mkdir -p ~/.tflint.d/plugins
+        mv ~/azurerm_linter/tflint-ruleset-azurerm ~/.tflint.d/plugins
+        curl -Ls https://github.com/tfsec/tfsec/releases/download/v0.39.14/tfsec-linux-amd64 -o tfsec-linux-amd64
+        chmod +x ./tfsec-linux-amd64
+        sudo mv ./tfsec-linux-amd64 /usr/local/bin/tfsec
+      displayName: 'Install tools for validations - tflint and tfsec along with tflint-ruleset-azurerm ruleset'
+
+    - bash: |
+        curl -Ls https://github.com/tfsec/tfsec/releases/download/v0.39.14/tfsec-linux-amd64 -o tfsec-linux-amd64
+        chmod +x ./tfsec-linux-amd64
+        sudo mv ./tfsec-linux-amd64 /usr/local/bin/tfsec
+      displayName: 'Install tfsec'
+
+    - bash: |
+        cd $(folder_context)
+        tflint ./main.tf --var-file=./varvalues/dev.tfvars --loglevel=trace  
+      displayName: 'Terraform tflint execution'
+      
+    - bash: |
+        cd $(folder_context)
+        tfsec . --tfvars-file=./varvalues/dev.tfvars -e GEN003 --verbose
+      displayName: 'Terraform security scan execution'
+
+    - bash: |
+
+        cp -rf $(System.DefaultWorkingDirectory)/Terraform/ $(System.DefaultWorkingDirectory)/dev
+        cp -rf $(System.DefaultWorkingDirectory)/Terraform/ $(System.DefaultWorkingDirectory)/test
+        cp -rf $(System.DefaultWorkingDirectory)/Terraform/ $(System.DefaultWorkingDirectory)/prod
+
+        mkdir -p $(System.DefaultWorkingDirectory)/Terraform/outputs
+        
+        cd $(System.DefaultWorkingDirectory)/dev/environments
+        echo $(pwd)
+        echo $(ls)
+        terraform init -backend-config='resource_group_name=$(state-resource-group)' -backend-config='storage_account_name=$(state-storage-account)' -backend-config='container_name=$(state-storage-container)' -backend-config='key=dev.tfstate' -backend-config='sas_token=$(state-sas-token)' -force-copy
+        
+        terraform plan -var-file=./varvalues/dev.tfvars -var='client_id=$(client-id)' -var='client_secret=$(client-secret)' -var='tenant_id=$(tenant-id)' -var='subscription_id=$(subscription-id)' -out='$(System.DefaultWorkingDirectory)/Terraform/outputs/dev.plan' -input=false
+
+        cd $(System.DefaultWorkingDirectory)/test/environments
+        terraform init -backend-config='resource_group_name=$(state-resource-group)' -backend-config='storage_account_name=$(state-storage-account)' -backend-config='container_name=$(state-storage-container)' -backend-config='key=test.tfstate' -backend-config='sas_token=$(state-sas-token)' -force-copy
+
+        terraform plan -var-file=./varvalues/test.tfvars -var='client_id=$(client-id)' -var='client_secret=$(client-secret)' -var='tenant_id=$(tenant-id)' -var='subscription_id=$(subscription-id)' -out='$(System.DefaultWorkingDirectory)/Terraform/outputs/test.plan' -input=false
+
+        cd $(System.DefaultWorkingDirectory)/prod/environments
+        terraform init -backend-config='resource_group_name=$(state-resource-group)' -backend-config='storage_account_name=$(state-storage-account)' -backend-config='container_name=$(state-storage-container)' -backend-config='key=prod.tfstate' -backend-config='sas_token=$(state-sas-token)' -force-copy
+
+        terraform plan -var-file=./varvalues/prod.tfvars -var='client_id=$(client-id)' -var='client_secret=$(client-secret)' -var='tenant_id=$(tenant-id)' -var='subscription_id=$(subscription-id)' -out='$(System.DefaultWorkingDirectory)/Terraform/outputs/prod.plan' -input=false
+      displayName: 'Executing Terraform commands'
+
+    - bash: |
+        cd $(System.DefaultWorkingDirectory)/Terraform/tests/unittests
+        go test ./...  -v -subscription_id $(subscription-id) -client_id $(client-id) -tenant_id $(tenant-id) -client_secret $(client-secret)
+      displayName: 'Executing TerraTest unit test scripts'  
+
+    - bash: |
+        cd $(System.DefaultWorkingDirectory)/Terraform/tests/integrationtests
+        go test ./...  -v -subscription_id $(subscription-id) -client_id $(client-id) -tenant_id $(tenant-id) -client_secret $(client-secret) -state_resource_group $(state-resource-group)  -state_storage_account $(state-storage-account)  -state_storage_container $(state-storage-container) -state_file_name $(state-file-name) -state_sas_token $(state-sas-token)
+      displayName: 'Executing TerraTest integration test scripts'  
+
+    
+
+    
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: '$(System.DefaultWorkingDirectory)/Terraform/outputs'
+        artifactName: environments
+
+- stage: development_env
+  jobs:
+  - deployment: development_environment
+    displayName: development_environment
+    pool:
+      vmImage: Ubuntu-18.04
+    environment: dev
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          - task: AzureKeyVault@1
+            inputs:
+              azureSubscription: 'book-azure-access'
+              KeyVaultName: 'book-keyvault'
+              SecretsFilter: 'state-resource-group, state-storage-container, state-storage-account, state-file-name, state-sas-token, client-id, client-secret, subscription-id, tenant-id'
+            displayName: 'Get key vault secrets as pipeline variables'
+
+          - bash: |
+              curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo apt-key add -
+              sudo apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main"
+              sudo apt-get update && sudo apt-get install terraform=0.14.10
+              terraform -help
+            displayName: 'Install Terraform'
+
+          - task: DownloadBuildArtifacts@0
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'environments'
+              downloadPath: '$(Build.SourcesDirectory)/Terraform'
+
+          - bash: |
+              cd '$(Build.SourcesDirectory)/Terraform/environments'
+              terraform init -backend-config='resource_group_name=$(state-resource-group)' -backend-config='storage_account_name=$(state-storage-account)' -backend-config='container_name=$(state-storage-container)' -backend-config='key=dev.tfstate' -backend-config='sas_token=$(state-sas-token)'
+              terraform apply './dev.plan' 
+            displayName: 'Executing Terraform apply commands'
+
+- stage: test_env
+  jobs:
+  - deployment: test_environment
+    displayName: test_environment
+    pool:
+      vmImage: Ubuntu-18.04
+    environment: test
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          - task: AzureKeyVault@1
+            inputs:
+              azureSubscription: 'book-azure-access'
+              KeyVaultName: 'book-keyvault'
+              SecretsFilter: 'state-resource-group, state-storage-container, state-storage-account, state-file-name, state-sas-token, client-id, client-secret, subscription-id, tenant-id'
+            displayName: 'Get key vault secrets as pipeline variables'
+
+          - bash: |
+              curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo apt-key add -
+              sudo apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main"
+              sudo apt-get update && sudo apt-get install terraform=0.14.10
+              terraform -help
+            displayName: 'Install Terraform'
+
+          - task: DownloadBuildArtifacts@0
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'environments'
+              downloadPath: '$(Build.SourcesDirectory)/Terraform'
+
+          - bash: |
+              cd '$(Build.SourcesDirectory)/Terraform/environments'
+              terraform init -backend-config='resource_group_name=$(state-resource-group)' -backend-config='storage_account_name=$(state-storage-account)' -backend-config='container_name=$(state-storage-container)' -backend-config='key=test.tfstate' -backend-config='sas_token=$(state-sas-token)'
+              terraform apply './test.plan' 
+            displayName: 'Executing Terraform apply commands'
+
+- stage: prod_env
+  jobs:
+  - deployment: prod_environment
+    displayName: prod_environment
+    pool:
+      vmImage: Ubuntu-18.04
+    environment: prod
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          - task: AzureKeyVault@1
+            inputs:
+              azureSubscription: 'book-azure-access'
+              KeyVaultName: 'rbook-keyvault'
+              SecretsFilter: 'state-resource-group, state-storage-container, state-storage-account, state-file-name, state-sas-token'
+            displayName: 'Get key vault secrets as pipeline variables'
+
+          - bash: |
+              curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo apt-key add -
+              sudo apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main"
+              sudo apt-get update && sudo apt-get install terraform=0.14.10
+              terraform -help
+            displayName: 'Install Terraform'
+
+          - task: DownloadBuildArtifacts@0
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'environments'
+              downloadPath: '$(Build.SourcesDirectory)/Terraform'
+
+          - bash: |
+              cd '$(Build.SourcesDirectory)/Terraform/environments'
+              terraform init -backend-config='resource_group_name=$(state-resource-group)' -backend-config='storage_account_name=$(state-storage-account)' -backend-config='container_name=$(state-storage-container)' -backend-config='key=prod.tfstate' -backend-config='sas_token=$(state-sas-token)'
+              terraform apply './prod.plan' 
+            displayName: 'Executing Terraform apply commands'
